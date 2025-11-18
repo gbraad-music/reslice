@@ -1,8 +1,5 @@
-// Minimal SDL2 + ImGui + aubio GUI.
-// Tracker-aligned, always-tall rows: 16 rows per bar (default), rows stay ~36px tall (adjustable).
-// Supports any phrase length: 64 rows for 4 bars, 10s at 140bpm gives 94 tracker rows, etc.
-// Waveform, gridlines, row numbers, markers and play buttons all align vertically in a large scrollable area.
-
+// SDL2 + ImGui + aubio GUI. Tracker-style: Tall, scrollable musical rows; green playhead animates in segment as audio plays.
+// Markers can be added (left click row) and removed (right click row).
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_opengl2.h"
@@ -35,7 +32,6 @@ static float detected_bpm = 140.f;
 static int base_note = 36;
 static std::string loaded_filename, base_no_ext;
 static std::mutex markers_mtx;
-static std::atomic<bool> detect_in_progress{false};
 
 struct Playback {
     bool playing = false;
@@ -142,6 +138,7 @@ void detect_onsets_aubio(float bpm, int ppqn) {
     markers = std::move(out);
 }
 
+// --- TRACKER PANEL ---
 void draw_tracker_and_wave(float rowNumWidth, float laneWidth, float markerWidth, float panel_height, int rows_per_bar, float bpm) {
     if (waveform.empty() || g_wf.envelope.empty() || samplerate <= 0 || bpm <= 0.0f) {
         ImGui::TextUnformatted("No waveform loaded");
@@ -153,33 +150,48 @@ void draw_tracker_and_wave(float rowNumWidth, float laneWidth, float markerWidth
     int total_rows = std::ceil(audio_length / (seconds_per_bar / rows_per_bar));
     float seconds_per_row = seconds_per_bar / rows_per_bar;
 
+    // Keep area tall for scroll, restore cursor to top for rendering
     ImGui::BeginChild("tracker_rows", ImVec2(rowNumWidth + laneWidth + markerWidth, panel_height),
         true, ImGuiWindowFlags_AlwaysVerticalScrollbar | ImGuiWindowFlags_HorizontalScrollbar);
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(rowNumWidth + laneWidth + markerWidth, total_rows * row_height));
+    ImGui::SetCursorScreenPos(origin);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 origin = ImGui::GetCursorScreenPos();
     float scrollY = ImGui::GetScrollY();
 
-    // PLAY SEGMENT HIGHLIGHT (draw segment green rect for currently playing range)
+    // --- PLAY segment rectangle + ANIMATED GREEN PLAYHEAD ---
     if (g_play.playing) {
         float start_sec = g_play.start / float(samplerate);
         float end_sec   = g_play.end   / float(samplerate);
+        float current_sec = g_play.cursor / float(samplerate);
+
         int start_row = int(start_sec / seconds_per_row);
         int end_row   = int(end_sec   / seconds_per_row);
         float y1 = origin.y + start_row * row_height - scrollY;
         float y2 = origin.y + end_row * row_height - scrollY;
-        // Clamp for visibility
         float panel_bottom = origin.y + panel_height;
         y1 = std::max(y1, origin.y);
         y2 = std::min(y2, panel_bottom);
-        if (y2 > y1)
+        if (y2 > y1) {
             dl->AddRectFilled(
                 ImVec2(origin.x + rowNumWidth, y1),
                 ImVec2(origin.x + rowNumWidth + laneWidth, y2),
-                IM_COL32(60,255,80,60));
+                IM_COL32(60,255,80,40));
+        }
+        if (end_sec > start_sec) {
+            float seg_frac = (current_sec - start_sec) / (end_sec - start_sec);
+            seg_frac = std::clamp(seg_frac, 0.0f, 1.0f);
+            float playhead_y = y1 + (y2 - y1) * seg_frac;
+            dl->AddLine(
+                ImVec2(origin.x + rowNumWidth, playhead_y),
+                ImVec2(origin.x + rowNumWidth + laneWidth, playhead_y),
+                IM_COL32(40,255,60,255),
+                3.2f
+            );
+        }
     }
 
-    // Markers thread lock
     std::lock_guard<std::mutex> lg(markers_mtx);
 
     for (int row = 0; row < total_rows; ++row) {
@@ -189,20 +201,28 @@ void draw_tracker_and_wave(float rowNumWidth, float laneWidth, float markerWidth
         if (y + row_height < origin.y) continue;
         if (y > origin.y + panel_height) break;
 
-        // Row bg
+        ImGui::SetCursorScreenPos(ImVec2(origin.x, y));
+        bool hovered = false;
+        bool left_clicked = false, right_clicked = false;
+        if (ImGui::InvisibleButton(("rowbtn"+std::to_string(row)).c_str(), ImVec2(rowNumWidth + laneWidth, row_height))) {
+            hovered = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            hovered = true;
+            if (ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemActive()) left_clicked = true;
+            if (ImGui::IsMouseClicked(1) && !ImGui::IsAnyItemActive()) right_clicked = true;
+        }
+
+        // Row BG, number, lines
         ImU32 rowbg = row % 2 ? IM_COL32(38,38,46,220) : IM_COL32(32,32,38,240);
         dl->AddRectFilled(ImVec2(origin.x, y), ImVec2(origin.x + rowNumWidth + laneWidth + markerWidth, y+row_height), rowbg, 0.0f);
-
-        // Row number
         char numb[12]; snprintf(numb, sizeof(numb), "%02d", row+1);
         dl->AddText(ImVec2(origin.x+10, y+10), IM_COL32(200,220,255,255), numb);
-
-        // Gridline (bold if bar boundary, always at top of row)
         float grid_thickness = (row % rows_per_bar == 0) ? 2.5f : 1.2f;
         ImU32 grid_col = (row % rows_per_bar == 0) ? IM_COL32(240,180,40,220) : IM_COL32(120,120,120,90);
         dl->AddLine(ImVec2(origin.x, y), ImVec2(origin.x + rowNumWidth + laneWidth + markerWidth, y), grid_col, grid_thickness);
 
-        // Waveform for this row
+        // Waveform for row
         float env_start_frac = row_start_sec / audio_length;
         float env_end_frac = row_end_sec / audio_length;
         int env_start_idx = int(env_start_frac * g_wf.envelope.size());
@@ -219,19 +239,16 @@ void draw_tracker_and_wave(float rowNumWidth, float laneWidth, float markerWidth
                 ImVec2(lane_center - half, cy), ImVec2(lane_center + half, cy), IM_COL32(70,220,255,205), 1.6f);
         }
 
-        // Marker in this row? (marker at TOP of row, not center!)
+        // Marker (at TOP of row)
         auto marker_it = std::find_if(markers.begin(), markers.end(), [&](const SliceMarker& m) {
             float mt = m.time;
             return mt >= row_start_sec && mt < row_end_sec;
         });
         if (marker_it != markers.end()) {
-            // Vertical position at TOP of row
             float marker_y = y;
             dl->AddLine(
                 ImVec2(origin.x + rowNumWidth, marker_y), ImVec2(origin.x + rowNumWidth + laneWidth, marker_y),
                 IM_COL32(255,70,40,255), 3.5f);
-
-            // Marker info: note name & [PLAY]
             float labelx = origin.x + rowNumWidth + laneWidth + 24.f;
             float labely = marker_y + 5.f;
             size_t mi = std::distance(markers.begin(), marker_it);
@@ -239,15 +256,32 @@ void draw_tracker_and_wave(float rowNumWidth, float laneWidth, float markerWidth
             static const char* kNoteNames[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
             int pc = (note%12+12)%12, oct = note/12 - 1;
             char nbuf[16]; snprintf(nbuf, sizeof(nbuf), "%s%d", kNoteNames[pc], oct);
-
             dl->AddText(ImVec2(labelx, labely), IM_COL32(230,230,230,255), nbuf);
-
             ImGui::SetCursorScreenPos(ImVec2(labelx + 60.f, labely - 3));
             ImGui::PushID(int(row));
             float t0 = marker_it->time;
             float t1 = (mi + 1 < markers.size()) ? markers[mi+1].time : audio_length;
             if (ImGui::SmallButton("PLAY")) play_segment_seconds(t0, t1);
             ImGui::PopID();
+        }
+
+        // --- ADD/REMOVE MARKER ---
+        if (left_clicked) {
+            float mt = row_start_sec;
+            auto it = std::find_if(markers.begin(), markers.end(), [&](const SliceMarker& m){
+                return std::fabs(m.time - mt) < 0.001f;
+            });
+            if (it == markers.end())
+                markers.insert(markers.begin() + std::distance(markers.begin(),
+                    std::lower_bound(markers.begin(), markers.end(), mt, [](const SliceMarker& a, float t){return a.time < t;})),
+                    SliceMarker{mt});
+        }
+        if (right_clicked && !markers.empty()) {
+            auto it = std::min_element(markers.begin(), markers.end(), [&](const SliceMarker& m1, const SliceMarker& m2){
+                return std::fabs(m1.time - row_start_sec) < std::fabs(m2.time - row_start_sec);
+            });
+            if (it != markers.end() && std::fabs(it->time - row_start_sec) < seconds_per_row/2)
+                markers.erase(it);
         }
     }
     ImGui::EndChild();
@@ -272,7 +306,8 @@ int main(int argc, char **argv) {
         detect_onsets_aubio(detected_bpm, 24);
     }
 
-    bool running = true; while (running) {
+    bool running = true;
+    while (running) {
         SDL_Event e; while (SDL_PollEvent(&e)) { ImGui_ImplSDL2_ProcessEvent(&e); if (e.type == SDL_QUIT) running=false; }
         ImGui_ImplOpenGL2_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
         ImGuiViewport* vp = ImGui::GetMainViewport(); ImVec2 pos = vp->Pos; ImVec2 siz = vp->Size;
