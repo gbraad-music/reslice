@@ -20,37 +20,61 @@ struct SliceMarker {
     bool selected = false;
 };
 
+struct Waveform {
+    std::vector<float> envelope; // normalized amplitude per block
+    int samplesPerBlock = 512;
+};
+
 static int samplerate = 44100;
 static std::vector<float> waveform; // mono
+static Waveform g_wf;
 static std::vector<SliceMarker> markers;
 static float detected_bpm = 120.f;
 static int ppqn = 480;
 static int base_note = 36;
 static std::string loaded_filename;
+static std::string base_no_ext;
 
 int seconds_to_ticks(float sec, float bpm, int ppqn) { return (int)(sec * (bpm / 60.f) * ppqn); }
 
 bool load_wav_mono(const char *path) {
-    // Use SDL_LoadWAV for simplicity (PCM only). Convert to mono by averaging channels.
     SDL_AudioSpec spec; Uint8 *buf; Uint32 len;
     if (!SDL_LoadWAV(path, &spec, &buf, &len)) return false;
     samplerate = spec.freq;
+
+    // Convert to float32 keeping channel count, then average to mono
+    SDL_AudioCVT cvt; if (SDL_BuildAudioCVT(&cvt, spec.format, spec.channels, spec.freq, AUDIO_F32, spec.channels, spec.freq) < 0) { SDL_FreeWAV(buf); return false; }
+    cvt.len = len; cvt.buf = (Uint8*)SDL_malloc(cvt.len * cvt.len_mult); if (!cvt.buf) { SDL_FreeWAV(buf); return false; }
+    SDL_memcpy(cvt.buf, buf, len); if (SDL_ConvertAudio(&cvt) < 0) { SDL_free(cvt.buf); SDL_FreeWAV(buf); return false; }
+
     int channels = spec.channels;
-    int bytes_per_sample = SDL_AUDIO_BITSIZE(spec.format) / 8;
-    int frames = len / (channels * bytes_per_sample);
+    int frames = (cvt.len_cvt / (sizeof(float) * channels));
     waveform.resize(frames);
+    float *fdata = (float*)cvt.buf;
     for (int i = 0; i < frames; ++i) {
-        float accum = 0.f;
-        for (int c = 0; c < channels; ++c) {
-            Uint8 *p = buf + (i * channels + c) * bytes_per_sample;
-            int16_t s = 0;
-            if (bytes_per_sample == 2) s = *(int16_t*)p; // assume S16
-            accum += s / 32768.f;
-        }
-        waveform[i] = accum / channels;
+        float accum = 0.f; for (int c = 0; c < channels; ++c) accum += fdata[i * channels + c];
+        waveform[i] = accum / channels; // mono average
     }
-    SDL_FreeWAV(buf);
+    SDL_free(cvt.buf); SDL_FreeWAV(buf);
+
     loaded_filename = std::string(path);
+    // derive base name without extension for output files
+    base_no_ext = loaded_filename;
+    {
+        size_t p = base_no_ext.find_last_of("/\\");
+        if (p != std::string::npos) base_no_ext = base_no_ext.substr(p + 1);
+        size_t d = base_no_ext.find_last_of('.');
+        if (d != std::string::npos) base_no_ext = base_no_ext.substr(0, d);
+    }
+    // compute vertical envelope
+    g_wf.envelope.clear();
+    g_wf.samplesPerBlock = 512;
+    for (size_t pos = 0; pos < waveform.size(); pos += g_wf.samplesPerBlock) {
+        float peak = 0.f;
+        size_t end = std::min(pos + (size_t)g_wf.samplesPerBlock, waveform.size());
+        for (size_t i = pos; i < end; ++i) { float a = std::fabs(waveform[i]); if (a > peak) peak = a; }
+        g_wf.envelope.push_back(peak);
+    }
     return true;
 }
 
@@ -60,36 +84,38 @@ void detect_onsets_aubio() {
     aubio_onset_t *onset = new_aubio_onset("default", win_size, hop_size, samplerate);
     aubio_tempo_t *tempo = new_aubio_tempo("default", win_size, hop_size, samplerate);
     fvec_t *buf = new_fvec(hop_size);
-    int total_frames = waveform.size();
-    for (int pos = 0; pos < total_frames; pos += hop_size) {
+    fvec_t *o_out = new_fvec(1);
+    fvec_t *t_out = new_fvec(1);
+    int total_frames = (int)waveform.size();
+    for (int pos = 0; pos < total_frames; pos += (int)hop_size) {
         int remain = std::min<int>(hop_size, total_frames - pos);
-        for (int i = 0; i < hop_size; ++i) buf->data[i] = (i < remain) ? waveform[pos + i] : 0.f;
-        aubio_tempo_do(tempo, buf, NULL);
-        smpl_t tempo_time = aubio_tempo_get_last(tempo);
-        if (tempo_time > 0) {
+        for (int i = 0; i < (int)hop_size; ++i) buf->data[i] = (i < remain) ? waveform[pos + i] : 0.f;
+        aubio_tempo_do(tempo, buf, t_out);
+        if (t_out->data[0] > 0) {
             float bpm = aubio_tempo_get_bpm(tempo);
-            if (bpm > 0) detected_bpm = bpm; // take first valid
+            if (bpm > 0) detected_bpm = bpm;
         }
-
-        aubio_onset_do(onset, buf, NULL);
-        smpl_t onset_time = aubio_onset_get_last(onset);
-        if (onset_time > 0) {
+        aubio_onset_do(onset, buf, o_out);
+        if (o_out->data[0] > 0) {
             float t = aubio_onset_get_last_s(onset);
             markers.push_back({t});
         }
     }
-    del_fvec(buf); del_aubio_onset(onset); del_aubio_tempo(tempo);
+    del_fvec(o_out); del_fvec(t_out); del_fvec(buf); del_aubio_onset(onset); del_aubio_tempo(tempo);
 }
 
 void export_sfz(const char *out_path) {
     std::ofstream f(out_path);
     f << "<group>\n";
     int total_frames = waveform.size();
+    std::string sample_name = loaded_filename;
+    size_t pos = sample_name.find_last_of("/\\");
+    if (pos != std::string::npos) sample_name = sample_name.substr(pos + 1);
     for (size_t i = 0; i < markers.size(); ++i) {
         int start = (int)(markers[i].time * samplerate);
         int end = (i + 1 < markers.size()) ? (int)(markers[i+1].time * samplerate) : total_frames;
         int note = base_note + (int)i;
-        f << "<region> sample=" << loaded_filename << " key=" << note << " offset=" << start << " end=" << end << "\n";
+        f << "<region> sample=" << sample_name << " key=" << note << " offset=" << start << " end=" << end << "\n";
     }
 }
 
@@ -128,45 +154,62 @@ void export_midi(const char *out_path) {
     f.write((char*)trkhdr, sizeof(trkhdr)); f.write((char*)track.data(), track.size());
 }
 
-void draw_waveform(float height) {
-    ImDrawList *dl = ImGui::GetWindowDrawList();
-    ImVec2 p0 = ImGui::GetCursorScreenPos();
-    float w = ImGui::GetContentRegionAvail().x;
-    int frames = waveform.size();
-    if (frames == 0) { ImGui::TextUnformatted("No waveform loaded"); return; }
-    // simple subsampling
-    int step = std::max(1, frames / (int)w);
-    for (int x = 0; x < (int)w; ++x) {
-        int idx = x * step; if (idx >= frames) break; float v = waveform[idx];
-        float y = p0.y + height * 0.5f - v * height * 0.45f;
-        dl->AddLine(ImVec2(p0.x + x, p0.y + height * 0.5f), ImVec2(p0.x + x, y), IM_COL32(100,200,255,255));
+void draw_waveform_vertical(const Waveform& wf, float laneWidth, float blockH, float height = 0.f) {
+    if (wf.envelope.empty()) { ImGui::TextUnformatted("No waveform loaded"); return; }
+    if (height <= 0) height = ImGui::GetContentRegionAvail().y;
+    ImGui::BeginChild("wave_lane", ImVec2(laneWidth + 16, height), true);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    float childH = ImGui::GetWindowSize().y;
+    float scrollY = ImGui::GetScrollY();
+    size_t blocks = wf.envelope.size();
+    float contentH = blocks * blockH;
+
+    // Interactive area
+    ImGui::InvisibleButton("lane_area", ImVec2(laneWidth, contentH));
+    bool hovered = ImGui::IsItemHovered();
+
+    // Visible range
+    int start = std::max(0, (int)std::floor(scrollY / blockH) - 1);
+    int end = std::min((int)blocks - 1, (int)std::ceil((scrollY + childH) / blockH) + 1);
+
+    // Envelope blocks
+    for (int i = start; i <= end; ++i) {
+        float y_top = origin.y + i * blockH - scrollY;
+        float amp = wf.envelope[i] * laneWidth;
+        dl->AddRectFilled(ImVec2(origin.x, y_top), ImVec2(origin.x + amp, y_top + blockH - 1), IM_COL32(100,200,255,255));
     }
-    // markers
-    for (size_t i=0;i<markers.size();++i){
-        float t = markers[i].time; int idx = (int)(t * samplerate); float x = p0.x + (idx / (float)frames) * w;
-        ImU32 col = markers[i].selected?IM_COL32(255,100,100,255):IM_COL32(255,255,0,200);
-        dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p0.y + height), col, 2.f);
+
+    // Onset lines (horizontal across lane)
+    for (auto &m : markers) {
+        int bi = (int)std::floor((m.time * samplerate) / (float)wf.samplesPerBlock);
+        float y = origin.y + bi * blockH - scrollY + blockH * 0.5f;
+        ImU32 col = m.selected ? IM_COL32(255,100,100,255) : IM_COL32(255,255,0,220);
+        dl->AddLine(ImVec2(origin.x, y), ImVec2(origin.x + laneWidth, y), col, 2.f);
     }
-    ImGui::InvisibleButton("wave", ImVec2(w, height));
-    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0)) {
-        float mx = ImGui::GetIO().MousePos.x - p0.x; float t = (mx / w) * (frames / (float)samplerate);
-        markers.push_back({t,true}); std::sort(markers.begin(), markers.end(),[](auto&a,auto&b){return a.time<b.time;});
-    }
-    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(1)) {
-        float mx = ImGui::GetIO().MousePos.x - p0.x; float t = (mx / w) * (frames / (float)samplerate);
-        // remove closest
-        if (!markers.empty()) {
-            auto it = std::min_element(markers.begin(), markers.end(),[&](auto&a,auto&b){return fabs(a.time - t) < fabs(b.time - t);});
+
+    // Mouse interactions
+    if (hovered) {
+        ImVec2 mp = ImGui::GetIO().MousePos;
+        float y_in = mp.y - origin.y + scrollY;
+        int bi = (int)std::floor(y_in / blockH);
+        bi = std::max(0, std::min(bi, (int)blocks - 1));
+        float t = (bi * wf.samplesPerBlock) / (float)samplerate;
+        if (ImGui::IsMouseClicked(0)) { markers.push_back({t,true}); std::sort(markers.begin(), markers.end(),[](auto&a,auto&b){return a.time<b.time;}); }
+        if (ImGui::IsMouseClicked(1) && !markers.empty()) {
+            auto it = std::min_element(markers.begin(), markers.end(), [&](auto &a, auto &b){ return std::fabs(a.time - t) < std::fabs(b.time - t); });
             markers.erase(it);
         }
     }
+
+    ImGui::EndChild();
 }
 
 int main(int argc, char **argv) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return 1;
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
     SDL_Window *window = SDL_CreateWindow("Reslice GUI", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1200, 600, SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE);
     SDL_GLContext glctx = SDL_GL_CreateContext(window);
     SDL_GL_SetSwapInterval(1);
@@ -190,10 +233,15 @@ int main(int argc, char **argv) {
         ImGui::SameLine(); if (ImGui::Button("Auto Detect")) detect_onsets_aubio();
         ImGui::SameLine(); if (ImGui::Button("Clear")) markers.clear();
         ImGui::Separator();
-        draw_waveform(200.f);
+        static float laneWidth = 160.f; static float blockH = 4.0f;
+        ImGui::SliderFloat("Lane Width", &laneWidth, 40.f, 400.f);
+        ImGui::SliderFloat("Block Height", &blockH, 1.0f, 12.0f);
+        draw_waveform_vertical(g_wf, laneWidth, blockH);
         ImGui::Separator();
-        if (ImGui::Button("Export slices.sfz")) export_sfz("slices.sfz");
-        ImGui::SameLine(); if (ImGui::Button("Export slices.mid")) export_midi("slices.mid");
+        std::string sfz = base_no_ext.empty() ? std::string("slices.sfz") : (base_no_ext + "-slices.sfz");
+        std::string mid = base_no_ext.empty() ? std::string("slices.mid") : (base_no_ext + "-slices.mid");
+        ImGui::Text("Output: %s, %s", sfz.c_str(), mid.c_str());
+        if (ImGui::Button("Confirm: Generate")) { export_sfz(sfz.c_str()); export_midi(mid.c_str()); }
         ImGui::Text("Markers: %zu", markers.size());
         for (size_t i=0;i<markers.size();++i) {
             ImGui::PushID((int)i);

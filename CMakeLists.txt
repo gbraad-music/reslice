@@ -17,7 +17,8 @@ set(ENV{PKG_CONFIG_PATH} "/usr/local/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 # Find required packages
 find_package(PkgConfig REQUIRED)
 
-pkg_check_modules(SDL2 REQUIRED sdl2 aubio)
+pkg_check_modules(SDL2 REQUIRED sdl2)
+pkg_check_modules(AUBIO REQUIRED aubio)
 
 # GUI version
 add_executable(reslice-gui
@@ -35,6 +36,7 @@ target_include_directories(reslice-gui PRIVATE
     imgui
     imgui/backends
     ${SDL2_INCLUDE_DIRS}
+    ${AUBIO_INCLUDE_DIRS}
 )
 
 target_link_libraries(reslice-gui PRIVATE
@@ -62,6 +64,7 @@ endif()
 
 target_compile_options(reslice-gui PRIVATE
     ${SDL2_CFLAGS_OTHER}
+    ${AUBIO_CFLAGS_OTHER}
 )
 
 # Installation rules
