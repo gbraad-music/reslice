@@ -273,7 +273,7 @@ bool load_wav_mono(const char *path) {
 // ===============================================
 // ONSET DETECTION
 // ===============================================
-void detect_onsets_aubio(float bpm, int ppqn) {
+void detect_onsets_aubio(float bpm, int ppqn, bool detect_bpm = false) {
     std::vector<SliceMarker> out;
     uint_t hop_size = 512;
     uint_t win_size = 1024;
@@ -291,11 +291,13 @@ void detect_onsets_aubio(float bpm, int ppqn) {
             buf->data[i] = (i < remain) ? waveform[pos + i] : 0.f;
         }
 
-        // Detect tempo
-        aubio_tempo_do(tempo, buf, t_out);
-        if (t_out->data[0] > 0) {
-            float _bpm = aubio_tempo_get_bpm(tempo);
-            if (_bpm > 0) detected_bpm = _bpm;
+        // Detect tempo only if requested
+        if (detect_bpm) {
+            aubio_tempo_do(tempo, buf, t_out);
+            if (t_out->data[0] > 0) {
+                float _bpm = aubio_tempo_get_bpm(tempo);
+                if (_bpm > 0) detected_bpm = _bpm;
+            }
         }
 
         // Detect onsets
@@ -314,6 +316,23 @@ void detect_onsets_aubio(float bpm, int ppqn) {
     del_aubio_tempo(tempo);
 
     std::sort(out.begin(), out.end(), [](auto& a, auto& b) { return a.time < b.time; });
+    
+    // Quantize onsets to BPM grid
+    float seconds_per_beat = 60.0f / bpm;
+    float seconds_per_bar = seconds_per_beat * 4.0f;
+    float quantize_unit = seconds_per_bar / ppqn;
+    
+    for (auto& marker : out) {
+        float grid_pos = marker.time / quantize_unit;
+        marker.time = round(grid_pos) * quantize_unit;
+    }
+    
+    // Remove duplicates after quantization
+    auto last = std::unique(out.begin(), out.end(), [](const SliceMarker& a, const SliceMarker& b) {
+        return fabs(a.time - b.time) < 0.001f;
+    });
+    out.erase(last, out.end());
+    
     markers = std::move(out);
 }
 
@@ -568,7 +587,7 @@ int main(int argc, char **argv) {
     static int rows_per_bar = 16;
     if (argc > 1 && load_wav_mono(argv[1])) {
         audio_reopen_for_current();
-        detect_onsets_aubio(detected_bpm, 24);
+        detect_onsets_aubio(detected_bpm, 24, true);
     }
 
     bool running = true;
@@ -590,7 +609,7 @@ int main(int argc, char **argv) {
         ImGui::SliderFloat("Row# Width", &rowNumWidth, 36.f, 160.f);
         ImGui::SliderFloat("Wave Lane Width", &laneWidth, 160.f, 700.f);
         ImGui::SliderFloat("Marker Area Width", &markerWidth, 100.f, 900.f);
-        if (ImGui::Button("Auto Detect")) detect_onsets_aubio(detected_bpm, 24);
+        if (ImGui::Button("Auto Detect")) detect_onsets_aubio(detected_bpm, 24, false);
         ImGui::SameLine(); if (ImGui::Button("Clear")) markers.clear();
         if (ImGui::Button("Play All")) {
             g_play.start = 0; g_play.cursor = 0; g_play.end = waveform.size(); g_play.playing = true;
