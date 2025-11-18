@@ -3,6 +3,7 @@
 #include "imgui_impl_opengl2.h"
 #include <SDL.h>
 #include <SDL_opengl.h>
+#include <array>
 #include <vector>
 #include <string>
 #include <cmath>
@@ -96,8 +97,9 @@ void print_regions_debug(const std::string& sample_name, const std::vector<Sampl
 // WAVEFORM AND AUDIO STATE
 // ===============================================
 struct Waveform {
-    std::vector<float> envelope;
-    int samplesPerBlock = 128;
+    std::vector<float> envelope;              // amplitude envelope
+    std::vector<std::array<float,3>> bands;   // low/mid/high energy per block
+    int samplesPerBlock = 1024;
 };
 
 struct Playback {
@@ -117,6 +119,49 @@ static int base_note = 36;
 static std::string loaded_filename;
 static std::mutex markers_mtx;
 static Playback g_play;
+
+void build_waveform_with_fft(const std::vector<float>& audio, int samplerate, Waveform& wf) {
+    uint_t win_size = wf.samplesPerBlock;
+    uint_t hop_size = win_size / 2;
+
+    aubio_pvoc_t* pv = new_aubio_pvoc(win_size, hop_size);
+    fvec_t* in = new_fvec(hop_size);
+    cvec_t* fftgrain = new_cvec(win_size);
+
+    size_t total_frames = audio.size();
+    for (size_t pos = 0; pos < total_frames; pos += hop_size) {
+        // fill input buffer
+        for (uint_t i = 0; i < hop_size; i++) {
+            in->data[i] = (pos+i < total_frames) ? audio[pos+i] : 0.f;
+        }
+
+        // run FFT
+        aubio_pvoc_do(pv, in, fftgrain);
+
+        float low=0, mid=0, high=0;
+        for (uint_t k = 0; k < fftgrain->length; k++) {
+            float freq = (float)k * samplerate / win_size;
+            float mag = fftgrain->norm[k];
+            if (freq < 200) low += mag;
+            else if (freq < 2000) mid += mag;
+            else high += mag;
+        }
+
+        // normalize bands
+        float sum = low+mid+high + 1e-8f;
+        wf.bands.push_back({low/sum, mid/sum, high/sum});
+
+        // envelope (RMS)
+        float rms = 0.f;
+        for (uint_t i = 0; i < hop_size; i++) rms += in->data[i]*in->data[i];
+        rms = sqrt(rms / hop_size);
+        wf.envelope.push_back(rms);
+    }
+
+    del_aubio_pvoc(pv);
+    del_fvec(in);
+    del_cvec(fftgrain);
+}
 
 // ===============================================
 // AUDIO PLAYBACK
@@ -216,17 +261,12 @@ bool load_wav_mono(const char *path) {
     loaded_filename = std::string(path);
 
     // Build waveform envelope for visualization
-    g_wf.samplesPerBlock = 128;
+    g_wf.samplesPerBlock = 1024; // FFT window size
     g_wf.envelope.clear();
-    for (size_t pos = 0; pos < waveform.size(); pos += g_wf.samplesPerBlock) {
-        float peak = 0.f;
-        size_t end = std::min(pos + (size_t)g_wf.samplesPerBlock, waveform.size());
-        for (size_t i = pos; i < end; ++i) {
-            float a = std::fabs(waveform[i]);
-            if (a > peak) peak = a;
-        }
-        g_wf.envelope.push_back(peak);
-    }
+    g_wf.bands.clear();
+
+    build_waveform_with_fft(waveform, samplerate, g_wf);
+
     return true;
 }
 
@@ -340,13 +380,19 @@ void draw_waveform_for_row(const RenderContext& ctx, int row, int rows_per_bar) 
 
     for (int e = 0; e < bars; ++e) {
         float amp = g_wf.envelope[env_start_idx + e];
+        auto band = g_wf.bands[env_start_idx + e];
         float half = amp * (ctx.laneWidth / 2.f);
         float frac = bars > 1 ? e / float(bars - 1) : 0.5f;
         float cy = wf_y1 + frac * (wf_y2 - wf_y1);
+
+        int r = int(255 * band[0]); // low
+        int g = int(255 * band[1]); // mid
+        int b = int(255 * band[2]); // high
+
         ctx.dl->AddLine(
             ImVec2(lane_center - half, cy),
             ImVec2(lane_center + half, cy),
-            IM_COL32(70, 220, 255, 205), 1.6f);
+            IM_COL32(r,g,b,220), 1.6f);
     }
 }
 
