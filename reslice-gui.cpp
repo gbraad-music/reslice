@@ -5,17 +5,12 @@
 #include <SDL_opengl.h>
 #include <vector>
 #include <string>
-#include <fstream>
-#include <algorithm>
 #include <cmath>
 #include <mutex>
-#include <atomic>
+#include <algorithm>
 #include <aubio/aubio.h>
 
-struct SliceMarker {
-    float time; // seconds
-    bool selected = false;
-};
+struct SliceMarker { float time; };
 
 struct Waveform {
     std::vector<float> envelope;
@@ -28,9 +23,8 @@ static Waveform g_wf;
 static std::vector<SliceMarker> markers;
 static float detected_bpm = 140.f;
 static int base_note = 36;
-static std::string loaded_filename, base_no_ext;
+static std::string loaded_filename;
 static std::mutex markers_mtx;
-static std::atomic<bool> detect_in_progress{false};
 
 struct Playback {
     bool playing = false;
@@ -68,22 +62,15 @@ static void play_segment_seconds(float start_s, float end_s) {
 }
 static void stop_playback() { g_play.playing = false; }
 
-int seconds_to_ticks(float sec, float bpm, int ppqn) { return (int)std::lround(sec * (bpm / 60.f) * ppqn); }
-float ticks_to_seconds(int ticks, float bpm, int ppqn) { return (ticks / (float)ppqn) * (60.0f / bpm); }
-float quantize_time(float sec, float bpm, int ppqn) {
-    if (bpm <= 0.0f) return sec;
-    int ticks = (int)std::lround(sec * (bpm / 60.f) * ppqn);
-    return ticks_to_seconds(ticks, bpm, ppqn);
-}
-
-// ------ WAV LOADING ------
 bool load_wav_mono(const char *path) {
     SDL_AudioSpec spec; Uint8 *buf; Uint32 len;
     if (!SDL_LoadWAV(path, &spec, &buf, &len)) return false;
     samplerate = spec.freq;
-    SDL_AudioCVT cvt; if (SDL_BuildAudioCVT(&cvt, spec.format, spec.channels, spec.freq, AUDIO_F32, spec.channels, spec.freq) < 0) { SDL_FreeWAV(buf); return false; }
+    SDL_AudioCVT cvt;
+    if (SDL_BuildAudioCVT(&cvt, spec.format, spec.channels, spec.freq, AUDIO_F32, spec.channels, spec.freq) < 0) { SDL_FreeWAV(buf); return false; }
     cvt.len = len; cvt.buf = (Uint8*)SDL_malloc(cvt.len * cvt.len_mult); if (!cvt.buf) { SDL_FreeWAV(buf); return false; }
-    SDL_memcpy(cvt.buf, buf, len); if (SDL_ConvertAudio(&cvt) < 0) { SDL_free(cvt.buf); SDL_FreeWAV(buf); return false; }
+    SDL_memcpy(cvt.buf, buf, len);
+    if (SDL_ConvertAudio(&cvt) < 0) { SDL_free(cvt.buf); SDL_FreeWAV(buf); return false; }
     int channels = spec.channels;
     int frames = (cvt.len_cvt / (sizeof(float) * channels));
     waveform.resize(frames);
@@ -94,11 +81,6 @@ bool load_wav_mono(const char *path) {
     }
     SDL_free(cvt.buf); SDL_FreeWAV(buf);
     loaded_filename = std::string(path);
-    base_no_ext = loaded_filename;
-    size_t p = base_no_ext.find_last_of("/\\");
-    if (p != std::string::npos) base_no_ext = base_no_ext.substr(p + 1);
-    size_t d = base_no_ext.find_last_of('.');
-    if (d != std::string::npos) base_no_ext = base_no_ext.substr(0, d);
     g_wf.samplesPerBlock = 128;
     g_wf.envelope.clear();
     for (size_t pos = 0; pos < waveform.size(); pos += g_wf.samplesPerBlock) {
@@ -108,12 +90,6 @@ bool load_wav_mono(const char *path) {
         g_wf.envelope.push_back(peak);
     }
     return true;
-}
-
-// ------ AUBIO ------
-// Use fallback for aubio_onset_get_last_s()
-inline float get_onset_last_time(aubio_onset_t* onset, uint_t hop_size, int samplerate) {
-    return aubio_onset_get_last(onset) * ((float)hop_size / samplerate);
 }
 
 void detect_onsets_aubio(float bpm, int ppqn) {
@@ -135,28 +111,16 @@ void detect_onsets_aubio(float bpm, int ppqn) {
         }
         aubio_onset_do(onset, buf, o_out);
         if (o_out->data[0] > 0) {
-            float t_frames = aubio_onset_get_last(onset);
-            float t = t_frames / ((float)samplerate);
-            printf("Detected aubio onset: aubio_onset_get_last() = %f (frames), time = %f (seconds)\n", t_frames, t);
+            float t_frames = aubio_onset_get_last(onset);  // sample frames
+            float t = t_frames / (float)samplerate;        // seconds
             out.push_back({t});
         }
     }
     del_fvec(o_out); del_fvec(t_out); del_fvec(buf); del_aubio_onset(onset); del_aubio_tempo(tempo);
     std::sort(out.begin(), out.end(), [](auto&a,auto&b){return a.time<b.time;});
     markers = std::move(out);
-
-    // Also print all marker times and rows for confirmation
-    float seconds_per_bar = (60.0f / detected_bpm) * 4.0f;
-    int rows_per_bar_dbg = 16;
-    float seconds_per_row = seconds_per_bar / rows_per_bar_dbg;
-    printf("Detected Markers (%zu):\n", markers.size());
-    for (size_t i = 0; i < markers.size(); ++i) {
-        int marker_row = int(markers[i].time / seconds_per_row);
-        printf("  marker[%02zu]: t=%.5f sec  --> row %d (start %.5fs)\n", i, markers[i].time, marker_row+1, marker_row*seconds_per_row);
-    }
 }
 
-// ------ TRACKER UI -------
 void draw_tracker_and_wave(float rowNumWidth, float laneWidth, float markerWidth, float panel_height, int rows_per_bar, float bpm) {
     if (waveform.empty() || g_wf.envelope.empty() || samplerate <= 0 || bpm <= 0.0f) {
         ImGui::TextUnformatted("No waveform loaded");
@@ -175,30 +139,33 @@ void draw_tracker_and_wave(float rowNumWidth, float laneWidth, float markerWidth
     ImVec2 origin = ImGui::GetCursorScreenPos();
     float scrollY = ImGui::GetScrollY();
 
-    // DEBUG: print info about shown region
-    printf("VISIBLE GRID: rows 1-%d covers [%.5f, %.5f] seconds\n", total_rows, 0.0f, total_rows * seconds_per_row);
+    // PLAY ANIMATION: show segment and playhead (highlight must scroll with content!)
+    if (g_play.playing && !markers.empty()) {
+        float play_sec = g_play.cursor / float(samplerate);
+        for (size_t m = 0; m + 1 < markers.size(); ++m) {
+            float t0 = markers[m].time, t1 = (m + 1 < markers.size()) ? markers[m+1].time : audio_length;
+            if (play_sec >= t0 && play_sec < t1) {
+                int play_row = int(t0 / seconds_per_row);
+                float frac = (play_sec - t0)/(t1-t0+1e-8f);
+                float y1 = origin.y + play_row * row_height - scrollY;
+                float y2 = y1 + row_height;
+                dl->AddRectFilled(ImVec2(origin.x + rowNumWidth, y1), ImVec2(origin.x + rowNumWidth + laneWidth, y2), IM_COL32(60,255,80,60));
+                float ph_y = y1 + frac * row_height;
+                dl->AddLine(ImVec2(origin.x + rowNumWidth, ph_y), ImVec2(origin.x + rowNumWidth + laneWidth, ph_y), IM_COL32(60,255,60,255), 3.2f);
+                break;
+            }
+        }
+    }
 
     std::lock_guard<std::mutex> lg(markers_mtx);
 
+    // DRAW ALL ROWS! No break. ImGui handles full scroll/content.
     for (int row = 0; row < total_rows; ++row) {
         float y = origin.y + row * row_height - scrollY;
         float row_start_sec = row * seconds_per_row;
         float row_end_sec = (row+1) * seconds_per_row;
-        if (y + row_height < origin.y) continue;
-        if (y > origin.y + panel_height) break;
+        if (y + row_height < origin.y) continue; // optional
 
-        // For debugging: find which markers are inside this row's time window
-        bool hit = false;
-        for (size_t m = 0; m < markers.size(); ++m) {
-            if (markers[m].time >= row_start_sec && markers[m].time < row_end_sec) {
-                if (!hit) printf("[DEBUG] row %02d (%.5f - %.5f):", row+1, row_start_sec, row_end_sec);
-                printf(" marker[%zu]=%.5f", m, markers[m].time);
-                hit = true;
-            }
-        }
-        if (hit) printf(" <== marker(s)!\n");
-
-        // --- UI drawing as before ---
         ImU32 rowbg = row % 2 ? IM_COL32(38,38,46,220) : IM_COL32(32,32,38,240);
         dl->AddRectFilled(ImVec2(origin.x, y), ImVec2(origin.x + rowNumWidth + laneWidth + markerWidth, y+row_height), rowbg, 0.0f);
 
@@ -221,34 +188,53 @@ void draw_tracker_and_wave(float rowNumWidth, float laneWidth, float markerWidth
             float half = amp * (laneWidth / 2.f);
             float frac = bars > 1 ? e / float(bars - 1) : 0.5f;
             float cy = wf_y1 + frac * (wf_y2 - wf_y1);
-            dl->AddLine(
-                ImVec2(lane_center - half, cy), ImVec2(lane_center + half, cy), IM_COL32(70,220,255,205), 1.6f);
+            dl->AddLine(ImVec2(lane_center - half, cy), ImVec2(lane_center + half, cy), IM_COL32(70,220,255,205), 1.6f);
         }
 
-        // Show marker(s) for this row (use interval match, not == row_start)
+        // Markers on gridline
+        bool marker_drawn = false;
         for (size_t m = 0; m < markers.size(); ++m) {
             if (markers[m].time >= row_start_sec && markers[m].time < row_end_sec) {
-                // Draw marker bar
-                dl->AddLine(ImVec2(origin.x + rowNumWidth, y), ImVec2(origin.x + rowNumWidth + laneWidth, y),
-                        IM_COL32(255,70,40,255), 3.5f);
-                // Note name and PLAY
+                float marker_y = y;
+                dl->AddLine(ImVec2(origin.x + rowNumWidth, marker_y),
+                            ImVec2(origin.x + rowNumWidth + laneWidth, marker_y),
+                            IM_COL32(255,70,40,255), 3.5f);
                 float labelx = origin.x + rowNumWidth + laneWidth + 24.f;
-                float labely = y + 5.f;
+                float labely = marker_y + 5.f;
                 int note = base_note + int(m);
                 static const char* kNoteNames[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
                 int pc = (note%12+12)%12, oct = note/12 - 1;
                 char nbuf[16]; snprintf(nbuf, sizeof(nbuf), "%s%d", kNoteNames[pc], oct);
                 dl->AddText(ImVec2(labelx, labely), IM_COL32(230,230,230,255), nbuf);
-
                 ImGui::SetCursorScreenPos(ImVec2(labelx + 60.f, labely - 3));
-                ImGui::PushID(int(row*1000 + m));
+                ImGui::PushID(int(row*5000 + m));
                 float t0 = markers[m].time;
                 float t1 = (m + 1 < markers.size()) ? markers[m+1].time : audio_length;
                 if (ImGui::SmallButton("PLAY")) play_segment_seconds(t0, t1);
                 ImGui::PopID();
+                marker_drawn = true;
             }
         }
+
+        // Marker insert/remove on gridline
+        float gridbtn_height = 12.0f;
+        ImGui::SetCursorScreenPos(ImVec2(origin.x, y));
+        ImGui::InvisibleButton(("gridbtn_" + std::to_string(row)).c_str(), ImVec2(rowNumWidth + laneWidth + markerWidth, gridbtn_height));
+        bool grid_hovered = ImGui::IsItemHovered() && ImGui::IsWindowFocused();
+        if (grid_hovered && ImGui::IsMouseClicked(0) && !marker_drawn) {
+            markers.push_back({row_start_sec});
+            std::sort(markers.begin(), markers.end(), [](auto&a,auto&b){return a.time < b.time;});
+        }
+        if (grid_hovered && ImGui::IsMouseClicked(1) && marker_drawn) {
+            markers.erase(std::remove_if(markers.begin(), markers.end(), [&](const SliceMarker& m) {
+                return m.time >= row_start_sec && m.time < row_end_sec;
+            }), markers.end());
+        }
     }
+
+    ImGui::SetCursorPosY(total_rows * row_height);
+    ImGui::Dummy(ImVec2(0,0));
+
     ImGui::EndChild();
 }
 
@@ -281,7 +267,6 @@ int main(int argc, char **argv) {
         float leftW = 350.f, centerW = rowNumWidth + laneWidth + markerWidth + 60.f;
         float center_h = siz.y - 16.f;
 
-        // Left panel
         ImGui::SetNextWindowPos(pos); ImGui::SetNextWindowSize(ImVec2(leftW, siz.y));
         ImGui::Begin("LeftPanel", nullptr, pf);
         ImGui::Text("File: %s", loaded_filename.c_str());
@@ -297,14 +282,16 @@ int main(int argc, char **argv) {
         ImGui::SameLine(); if (ImGui::Button("Stop")) stop_playback();
         ImGui::End();
 
-        // Main panel: tracker/rows/waveform/markers
         ImGui::SetNextWindowPos(ImVec2(pos.x + leftW, pos.y));
         ImGui::SetNextWindowSize(ImVec2(centerW, siz.y));
         ImGui::Begin("WavePanel", nullptr, pf);
         draw_tracker_and_wave(rowNumWidth, laneWidth, markerWidth, center_h, rows_per_bar, detected_bpm);
         ImGui::End();
 
-        ImGui::Render(); glViewport(0,0,(int)io.DisplaySize.x,(int)io.DisplaySize.y); glClearColor(0.1f,0.1f,0.12f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+        ImGui::Render();
+        glViewport(0,0,(int)io.DisplaySize.x,(int)io.DisplaySize.y);
+        glClearColor(0.1f,0.1f,0.12f,1.f);
+        glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(window);
     }
