@@ -461,11 +461,11 @@ void draw_tracker_and_wave(
     // Draw playback indicator (if playing)
     draw_playback_indicator(ctx, regions);
 
-    // Get visible region bounds for culling
-    ImVec2 clip_min = ImGui::GetWindowContentRegionMin();
-    ImVec2 clip_max = ImGui::GetWindowContentRegionMax();
-    float window_min_y = origin.y + clip_min.y;
-    float window_max_y = origin.y + clip_max.y;
+    // Get visible viewport bounds for culling
+    ImVec2 window_pos = ImGui::GetWindowPos();
+    ImVec2 window_size = ImGui::GetWindowSize();
+    float visible_min_y = window_pos.y;
+    float visible_max_y = window_pos.y + window_size.y;
 
     // MAIN ROW LOOP
     for (int row = 0; row < rowCalc.total_rows; ++row) {
@@ -473,7 +473,7 @@ void draw_tracker_and_wave(
         float row_height = 36.f;
         
         // Viewport culling: skip rows outside visible area
-        if (y + row_height < window_min_y || y > window_max_y) continue;
+        if (y + row_height < visible_min_y || y > visible_max_y) continue;
 
         // Draw row background
         ImU32 rowbg = row % 2 ? IM_COL32(38, 38, 46, 220) : IM_COL32(32, 32, 38, 240);
