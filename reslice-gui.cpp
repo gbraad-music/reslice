@@ -35,6 +35,44 @@ static int base_note = 36;
 static std::string loaded_filename;
 static std::string base_no_ext;
 
+struct Playback {
+    bool playing = false;
+    size_t start = 0, end = 0, cursor = 0;
+    float volume = 0.8f;
+    SDL_AudioDeviceID dev = 0;
+    SDL_AudioSpec spec{};
+} g_play;
+
+static void sdl_audio_cb(void* userdata, Uint8* stream, int len) {
+    Playback* p = (Playback*)userdata;
+    float* out = (float*)stream;
+    int frames = len / (int)sizeof(float); // mono
+    for (int i = 0; i < frames; ++i) {
+        float sample = 0.f;
+        if (p->playing && p->cursor < p->end && p->cursor < waveform.size()) {
+            sample = waveform[p->cursor++] * p->volume;
+            if (p->cursor >= p->end) p->playing = false;
+        }
+        out[i] = sample;
+    }
+}
+
+static void audio_reopen_for_current() {
+    if (g_play.dev) { SDL_CloseAudioDevice(g_play.dev); g_play.dev = 0; }
+    SDL_AudioSpec want{}; want.freq = samplerate; want.format = AUDIO_F32; want.channels = 1; want.samples = 1024; want.callback = sdl_audio_cb; want.userdata = &g_play;
+    g_play.dev = SDL_OpenAudioDevice(NULL, 0, &want, &g_play.spec, 0);
+    if (g_play.dev) SDL_PauseAudioDevice(g_play.dev, 0);
+}
+
+static void play_segment_seconds(float start_s, float end_s) {
+    size_t start = (size_t)(start_s * samplerate);
+    size_t end = (size_t)(end_s * samplerate);
+    if (end <= start) end = std::min(waveform.size(), start + (size_t)(0.5f * samplerate));
+    g_play.start = start; g_play.cursor = start; g_play.end = std::min(end, waveform.size()); g_play.playing = true;
+}
+
+static void stop_playback() { g_play.playing = false; }
+
 int seconds_to_ticks(float sec, float bpm, int ppqn) { return (int)(sec * (bpm / 60.f) * ppqn); }
 
 bool load_wav_mono(const char *path) {
@@ -173,11 +211,16 @@ void draw_waveform_vertical(const Waveform& wf, float laneWidth, float blockH, f
     int start = std::max(0, (int)std::floor(scrollY / blockH) - 1);
     int end = std::min((int)blocks - 1, (int)std::ceil((scrollY + childH) / blockH) + 1);
 
-    // Envelope blocks
+    // Midline
+    float cx = origin.x + laneWidth * 0.5f;
+    dl->AddLine(ImVec2(cx, origin.y), ImVec2(cx, origin.y + childH), IM_COL32(120,120,120,160), 1.0f);
+
+    // Envelope blocks centered on midline
     for (int i = start; i <= end; ++i) {
         float y_top = origin.y + i * blockH - scrollY;
         float amp = wf.envelope[i] * laneWidth;
-        dl->AddRectFilled(ImVec2(origin.x, y_top), ImVec2(origin.x + amp, y_top + blockH - 1), IM_COL32(100,200,255,255));
+        float half = amp * 0.5f;
+        dl->AddRectFilled(ImVec2(cx - half, y_top), ImVec2(cx + half, y_top + blockH - 1), IM_COL32(100,200,255,255));
     }
 
     // Onset lines (horizontal across lane)
@@ -186,6 +229,13 @@ void draw_waveform_vertical(const Waveform& wf, float laneWidth, float blockH, f
         float y = origin.y + bi * blockH - scrollY + blockH * 0.5f;
         ImU32 col = m.selected ? IM_COL32(255,100,100,255) : IM_COL32(255,255,0,220);
         dl->AddLine(ImVec2(origin.x, y), ImVec2(origin.x + laneWidth, y), col, 2.f);
+    }
+
+    // Playhead line
+    if (g_play.playing) {
+        int bi = (int)std::floor((g_play.cursor) / (float)wf.samplesPerBlock);
+        float y = origin.y + bi * blockH - scrollY + blockH * 0.5f;
+        dl->AddLine(ImVec2(origin.x, y), ImVec2(origin.x + laneWidth, y), IM_COL32(0,255,0,255), 2.0f);
     }
 
     // Mouse interactions
@@ -218,34 +268,54 @@ int main(int argc, char **argv) {
     ImGui_ImplSDL2_InitForOpenGL(window, glctx);
     ImGui_ImplOpenGL2_Init();
 
-    if (argc > 1) { load_wav_mono(argv[1]); detect_onsets_aubio(); }
+    if (argc > 1) { load_wav_mono(argv[1]); detect_onsets_aubio(); audio_reopen_for_current(); }
 
     bool running = true; while (running) {
         SDL_Event e; while (SDL_PollEvent(&e)) { ImGui_ImplSDL2_ProcessEvent(&e); if (e.type == SDL_QUIT) running=false; }
         ImGui_ImplOpenGL2_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
-        ImGui::Begin("Reslice");
+        ImGuiViewport* vp = ImGui::GetMainViewport(); ImVec2 pos = vp->Pos; ImVec2 siz = vp->Size;
+        ImGuiWindowFlags pf = ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoBringToFrontOnFocus|ImGuiWindowFlags_NoNavFocus;
+        static float laneWidth = 160.f; static float blockH = 4.0f; float leftW=300.f, centerW=laneWidth+24.f;
+
+        // Left panel
+        ImGui::SetNextWindowPos(pos); ImGui::SetNextWindowSize(ImVec2(leftW, siz.y));
+        ImGui::Begin("LeftPanel", nullptr, pf);
         ImGui::Text("File: %s", loaded_filename.c_str());
         ImGui::SliderInt("Base Note", &base_note, 0, 100);
-        ImGui::SliderFloat("Detected BPM", &detected_bpm, 40.f, 240.f);
-        if (ImGui::Button("Open WAV")) {
-            // Placeholder: integrate file dialog if desired
-        }
-        ImGui::SameLine(); if (ImGui::Button("Auto Detect")) detect_onsets_aubio();
+        ImGui::SliderFloat("BPM", &detected_bpm, 40.f, 240.f);
+        if (ImGui::Button("Auto Detect")) detect_onsets_aubio();
         ImGui::SameLine(); if (ImGui::Button("Clear")) markers.clear();
-        ImGui::Separator();
-        static float laneWidth = 160.f; static float blockH = 4.0f;
         ImGui::SliderFloat("Lane Width", &laneWidth, 40.f, 400.f);
         ImGui::SliderFloat("Block Height", &blockH, 1.0f, 12.0f);
+        if (ImGui::Button("Play All")) play_segment_seconds(0.f, waveform.size()/(float)samplerate);
+        ImGui::SameLine(); if (ImGui::Button("Stop")) stop_playback();
+        ImGui::End();
+
+        // Center panel
+        ImGui::SetNextWindowPos(ImVec2(pos.x + leftW, pos.y)); ImGui::SetNextWindowSize(ImVec2(centerW, siz.y));
+        ImGui::Begin("CenterPanel", nullptr, pf);
         draw_waveform_vertical(g_wf, laneWidth, blockH);
-        ImGui::Separator();
+        ImGui::End();
+
+        // Right panel
+        ImGui::SetNextWindowPos(ImVec2(pos.x + leftW + centerW, pos.y)); ImGui::SetNextWindowSize(ImVec2(siz.x - leftW - centerW, siz.y));
+        ImGui::Begin("RightPanel", nullptr, pf);
         std::string sfz = base_no_ext.empty() ? std::string("slices.sfz") : (base_no_ext + "-slices.sfz");
         std::string mid = base_no_ext.empty() ? std::string("slices.mid") : (base_no_ext + "-slices.mid");
-        ImGui::Text("Output: %s, %s", sfz.c_str(), mid.c_str());
+        ImGui::Text("Output:\n%s\n%s", sfz.c_str(), mid.c_str());
         if (ImGui::Button("Confirm: Generate")) { export_sfz(sfz.c_str()); export_midi(mid.c_str()); }
+        ImGui::Separator();
         ImGui::Text("Markers: %zu", markers.size());
         for (size_t i=0;i<markers.size();++i) {
             ImGui::PushID((int)i);
-            float t = markers[i].time; if (ImGui::DragFloat("time", &markers[i].time, 0.001f, 0.f, waveform.size()/(float)samplerate)) {
+            float maxT = waveform.size()/(float)samplerate;
+            if (ImGui::Button("Play")) {
+                float st = markers[i].time; float en = (i + 1 < markers.size()) ? markers[i+1].time : (waveform.size()/(float)samplerate);
+                play_segment_seconds(st, en);
+            }
+            ImGui::SameLine();
+            if (ImGui::DragFloat("time", &markers[i].time, 0.001f, 0.f, maxT)) {
+                markers[i].time = std::max(0.f, std::min(markers[i].time, maxT));
                 std::sort(markers.begin(), markers.end(),[](auto&a,auto&b){return a.time<b.time;});
             }
             ImGui::PopID();
