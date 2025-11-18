@@ -1,5 +1,3 @@
-// SDL2 + ImGui + aubio GUI. Tracker-style: Tall, scrollable musical rows; green playhead animates in segment as audio plays.
-// Markers can be added (left click row) and removed (right click row).
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_opengl2.h"
@@ -32,6 +30,7 @@ static float detected_bpm = 140.f;
 static int base_note = 36;
 static std::string loaded_filename, base_no_ext;
 static std::mutex markers_mtx;
+static std::atomic<bool> detect_in_progress{false};
 
 struct Playback {
     bool playing = false;
@@ -77,6 +76,7 @@ float quantize_time(float sec, float bpm, int ppqn) {
     return ticks_to_seconds(ticks, bpm, ppqn);
 }
 
+// ------ WAV LOADING ------
 bool load_wav_mono(const char *path) {
     SDL_AudioSpec spec; Uint8 *buf; Uint32 len;
     if (!SDL_LoadWAV(path, &spec, &buf, &len)) return false;
@@ -110,6 +110,12 @@ bool load_wav_mono(const char *path) {
     return true;
 }
 
+// ------ AUBIO ------
+// Use fallback for aubio_onset_get_last_s()
+inline float get_onset_last_time(aubio_onset_t* onset, uint_t hop_size, int samplerate) {
+    return aubio_onset_get_last(onset) * ((float)hop_size / samplerate);
+}
+
 void detect_onsets_aubio(float bpm, int ppqn) {
     std::vector<SliceMarker> out;
     uint_t hop_size = 512; uint_t win_size = 1024;
@@ -129,16 +135,28 @@ void detect_onsets_aubio(float bpm, int ppqn) {
         }
         aubio_onset_do(onset, buf, o_out);
         if (o_out->data[0] > 0) {
-            float t = quantize_time(aubio_onset_get_last_s(onset), bpm, ppqn);
+            float t_frames = aubio_onset_get_last(onset);
+            float t = t_frames / ((float)samplerate);
+            printf("Detected aubio onset: aubio_onset_get_last() = %f (frames), time = %f (seconds)\n", t_frames, t);
             out.push_back({t});
         }
     }
     del_fvec(o_out); del_fvec(t_out); del_fvec(buf); del_aubio_onset(onset); del_aubio_tempo(tempo);
     std::sort(out.begin(), out.end(), [](auto&a,auto&b){return a.time<b.time;});
     markers = std::move(out);
+
+    // Also print all marker times and rows for confirmation
+    float seconds_per_bar = (60.0f / detected_bpm) * 4.0f;
+    int rows_per_bar_dbg = 16;
+    float seconds_per_row = seconds_per_bar / rows_per_bar_dbg;
+    printf("Detected Markers (%zu):\n", markers.size());
+    for (size_t i = 0; i < markers.size(); ++i) {
+        int marker_row = int(markers[i].time / seconds_per_row);
+        printf("  marker[%02zu]: t=%.5f sec  --> row %d (start %.5fs)\n", i, markers[i].time, marker_row+1, marker_row*seconds_per_row);
+    }
 }
 
-// --- TRACKER PANEL ---
+// ------ TRACKER UI -------
 void draw_tracker_and_wave(float rowNumWidth, float laneWidth, float markerWidth, float panel_height, int rows_per_bar, float bpm) {
     if (waveform.empty() || g_wf.envelope.empty() || samplerate <= 0 || bpm <= 0.0f) {
         ImGui::TextUnformatted("No waveform loaded");
@@ -150,47 +168,15 @@ void draw_tracker_and_wave(float rowNumWidth, float laneWidth, float markerWidth
     int total_rows = std::ceil(audio_length / (seconds_per_bar / rows_per_bar));
     float seconds_per_row = seconds_per_bar / rows_per_bar;
 
-    // Keep area tall for scroll, restore cursor to top for rendering
     ImGui::BeginChild("tracker_rows", ImVec2(rowNumWidth + laneWidth + markerWidth, panel_height),
         true, ImGuiWindowFlags_AlwaysVerticalScrollbar | ImGuiWindowFlags_HorizontalScrollbar);
-    ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(rowNumWidth + laneWidth + markerWidth, total_rows * row_height));
-    ImGui::SetCursorScreenPos(origin);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 origin = ImGui::GetCursorScreenPos();
     float scrollY = ImGui::GetScrollY();
 
-    // --- PLAY segment rectangle + ANIMATED GREEN PLAYHEAD ---
-    if (g_play.playing) {
-        float start_sec = g_play.start / float(samplerate);
-        float end_sec   = g_play.end   / float(samplerate);
-        float current_sec = g_play.cursor / float(samplerate);
-
-        int start_row = int(start_sec / seconds_per_row);
-        int end_row   = int(end_sec   / seconds_per_row);
-        float y1 = origin.y + start_row * row_height - scrollY;
-        float y2 = origin.y + end_row * row_height - scrollY;
-        float panel_bottom = origin.y + panel_height;
-        y1 = std::max(y1, origin.y);
-        y2 = std::min(y2, panel_bottom);
-        if (y2 > y1) {
-            dl->AddRectFilled(
-                ImVec2(origin.x + rowNumWidth, y1),
-                ImVec2(origin.x + rowNumWidth + laneWidth, y2),
-                IM_COL32(60,255,80,40));
-        }
-        if (end_sec > start_sec) {
-            float seg_frac = (current_sec - start_sec) / (end_sec - start_sec);
-            seg_frac = std::clamp(seg_frac, 0.0f, 1.0f);
-            float playhead_y = y1 + (y2 - y1) * seg_frac;
-            dl->AddLine(
-                ImVec2(origin.x + rowNumWidth, playhead_y),
-                ImVec2(origin.x + rowNumWidth + laneWidth, playhead_y),
-                IM_COL32(40,255,60,255),
-                3.2f
-            );
-        }
-    }
+    // DEBUG: print info about shown region
+    printf("VISIBLE GRID: rows 1-%d covers [%.5f, %.5f] seconds\n", total_rows, 0.0f, total_rows * seconds_per_row);
 
     std::lock_guard<std::mutex> lg(markers_mtx);
 
@@ -201,28 +187,28 @@ void draw_tracker_and_wave(float rowNumWidth, float laneWidth, float markerWidth
         if (y + row_height < origin.y) continue;
         if (y > origin.y + panel_height) break;
 
-        ImGui::SetCursorScreenPos(ImVec2(origin.x, y));
-        bool hovered = false;
-        bool left_clicked = false, right_clicked = false;
-        if (ImGui::InvisibleButton(("rowbtn"+std::to_string(row)).c_str(), ImVec2(rowNumWidth + laneWidth, row_height))) {
-            hovered = true;
+        // For debugging: find which markers are inside this row's time window
+        bool hit = false;
+        for (size_t m = 0; m < markers.size(); ++m) {
+            if (markers[m].time >= row_start_sec && markers[m].time < row_end_sec) {
+                if (!hit) printf("[DEBUG] row %02d (%.5f - %.5f):", row+1, row_start_sec, row_end_sec);
+                printf(" marker[%zu]=%.5f", m, markers[m].time);
+                hit = true;
+            }
         }
-        if (ImGui::IsItemHovered()) {
-            hovered = true;
-            if (ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemActive()) left_clicked = true;
-            if (ImGui::IsMouseClicked(1) && !ImGui::IsAnyItemActive()) right_clicked = true;
-        }
+        if (hit) printf(" <== marker(s)!\n");
 
-        // Row BG, number, lines
+        // --- UI drawing as before ---
         ImU32 rowbg = row % 2 ? IM_COL32(38,38,46,220) : IM_COL32(32,32,38,240);
         dl->AddRectFilled(ImVec2(origin.x, y), ImVec2(origin.x + rowNumWidth + laneWidth + markerWidth, y+row_height), rowbg, 0.0f);
+
         char numb[12]; snprintf(numb, sizeof(numb), "%02d", row+1);
         dl->AddText(ImVec2(origin.x+10, y+10), IM_COL32(200,220,255,255), numb);
+
         float grid_thickness = (row % rows_per_bar == 0) ? 2.5f : 1.2f;
         ImU32 grid_col = (row % rows_per_bar == 0) ? IM_COL32(240,180,40,220) : IM_COL32(120,120,120,90);
         dl->AddLine(ImVec2(origin.x, y), ImVec2(origin.x + rowNumWidth + laneWidth + markerWidth, y), grid_col, grid_thickness);
 
-        // Waveform for row
         float env_start_frac = row_start_sec / audio_length;
         float env_end_frac = row_end_sec / audio_length;
         int env_start_idx = int(env_start_frac * g_wf.envelope.size());
@@ -239,49 +225,28 @@ void draw_tracker_and_wave(float rowNumWidth, float laneWidth, float markerWidth
                 ImVec2(lane_center - half, cy), ImVec2(lane_center + half, cy), IM_COL32(70,220,255,205), 1.6f);
         }
 
-        // Marker (at TOP of row)
-        auto marker_it = std::find_if(markers.begin(), markers.end(), [&](const SliceMarker& m) {
-            float mt = m.time;
-            return mt >= row_start_sec && mt < row_end_sec;
-        });
-        if (marker_it != markers.end()) {
-            float marker_y = y;
-            dl->AddLine(
-                ImVec2(origin.x + rowNumWidth, marker_y), ImVec2(origin.x + rowNumWidth + laneWidth, marker_y),
-                IM_COL32(255,70,40,255), 3.5f);
-            float labelx = origin.x + rowNumWidth + laneWidth + 24.f;
-            float labely = marker_y + 5.f;
-            size_t mi = std::distance(markers.begin(), marker_it);
-            int note = base_note + int(mi);
-            static const char* kNoteNames[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
-            int pc = (note%12+12)%12, oct = note/12 - 1;
-            char nbuf[16]; snprintf(nbuf, sizeof(nbuf), "%s%d", kNoteNames[pc], oct);
-            dl->AddText(ImVec2(labelx, labely), IM_COL32(230,230,230,255), nbuf);
-            ImGui::SetCursorScreenPos(ImVec2(labelx + 60.f, labely - 3));
-            ImGui::PushID(int(row));
-            float t0 = marker_it->time;
-            float t1 = (mi + 1 < markers.size()) ? markers[mi+1].time : audio_length;
-            if (ImGui::SmallButton("PLAY")) play_segment_seconds(t0, t1);
-            ImGui::PopID();
-        }
+        // Show marker(s) for this row (use interval match, not == row_start)
+        for (size_t m = 0; m < markers.size(); ++m) {
+            if (markers[m].time >= row_start_sec && markers[m].time < row_end_sec) {
+                // Draw marker bar
+                dl->AddLine(ImVec2(origin.x + rowNumWidth, y), ImVec2(origin.x + rowNumWidth + laneWidth, y),
+                        IM_COL32(255,70,40,255), 3.5f);
+                // Note name and PLAY
+                float labelx = origin.x + rowNumWidth + laneWidth + 24.f;
+                float labely = y + 5.f;
+                int note = base_note + int(m);
+                static const char* kNoteNames[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+                int pc = (note%12+12)%12, oct = note/12 - 1;
+                char nbuf[16]; snprintf(nbuf, sizeof(nbuf), "%s%d", kNoteNames[pc], oct);
+                dl->AddText(ImVec2(labelx, labely), IM_COL32(230,230,230,255), nbuf);
 
-        // --- ADD/REMOVE MARKER ---
-        if (left_clicked) {
-            float mt = row_start_sec;
-            auto it = std::find_if(markers.begin(), markers.end(), [&](const SliceMarker& m){
-                return std::fabs(m.time - mt) < 0.001f;
-            });
-            if (it == markers.end())
-                markers.insert(markers.begin() + std::distance(markers.begin(),
-                    std::lower_bound(markers.begin(), markers.end(), mt, [](const SliceMarker& a, float t){return a.time < t;})),
-                    SliceMarker{mt});
-        }
-        if (right_clicked && !markers.empty()) {
-            auto it = std::min_element(markers.begin(), markers.end(), [&](const SliceMarker& m1, const SliceMarker& m2){
-                return std::fabs(m1.time - row_start_sec) < std::fabs(m2.time - row_start_sec);
-            });
-            if (it != markers.end() && std::fabs(it->time - row_start_sec) < seconds_per_row/2)
-                markers.erase(it);
+                ImGui::SetCursorScreenPos(ImVec2(labelx + 60.f, labely - 3));
+                ImGui::PushID(int(row*1000 + m));
+                float t0 = markers[m].time;
+                float t1 = (m + 1 < markers.size()) ? markers[m+1].time : audio_length;
+                if (ImGui::SmallButton("PLAY")) play_segment_seconds(t0, t1);
+                ImGui::PopID();
+            }
         }
     }
     ImGui::EndChild();
