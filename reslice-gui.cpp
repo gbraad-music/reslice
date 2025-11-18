@@ -13,6 +13,9 @@
 #include <fstream>
 #include <algorithm>
 #include <cmath>
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include <aubio/aubio.h>
 
 struct SliceMarker {
@@ -30,10 +33,13 @@ static std::vector<float> waveform; // mono
 static Waveform g_wf;
 static std::vector<SliceMarker> markers;
 static float detected_bpm = 120.f;
-static int ppqn = 480;
+static int ppqn = 24;            // MIDI/export PPQN
+static int grid_ppqn = 24;       // Quantization grid PPQN
 static int base_note = 36;
 static std::string loaded_filename;
 static std::string base_no_ext;
+static std::mutex markers_mtx;
+static std::atomic<bool> detect_in_progress{false};
 
 struct Playback {
     bool playing = false;
@@ -73,7 +79,13 @@ static void play_segment_seconds(float start_s, float end_s) {
 
 static void stop_playback() { g_play.playing = false; }
 
-int seconds_to_ticks(float sec, float bpm, int ppqn) { return (int)(sec * (bpm / 60.f) * ppqn); }
+int seconds_to_ticks(float sec, float bpm, int ppqn) { return (int)std::lround(sec * (bpm / 60.f) * ppqn); }
+static float ticks_to_seconds(int ticks, float bpm, int ppqn) { return (ticks / (float)ppqn) * (60.0f / bpm); }
+static float quantize_time(float sec) {
+    if (detected_bpm <= 0.0f) return sec;
+    int ticks = (int)std::lround(sec * (detected_bpm / 60.f) * grid_ppqn);
+    return ticks_to_seconds(ticks, detected_bpm, grid_ppqn);
+}
 
 bool load_wav_mono(const char *path) {
     SDL_AudioSpec spec; Uint8 *buf; Uint32 len;
@@ -223,8 +235,24 @@ void draw_waveform_vertical(const Waveform& wf, float laneWidth, float blockH, f
         dl->AddRectFilled(ImVec2(cx - half, y_top), ImVec2(cx + half, y_top + blockH - 1), IM_COL32(100,200,255,255));
     }
 
+    // Grid lines per row (24-PPQN)
+    float bpm = detected_bpm > 0 ? detected_bpm : 120.f;
+    float samplesPerRow = samplerate * 60.0f / (bpm * grid_ppqn);
+    int blocks_visible_start = start;
+    int blocks_visible_end = end;
+    size_t total_samples = waveform.size();
+    int first_row = std::max(0, (int)std::floor(((blocks_visible_start * wf.samplesPerBlock)) / samplesPerRow) - 1);
+    int last_row = std::min((int)std::ceil((total_samples) / samplesPerRow) + 1, (int)std::ceil(((blocks_visible_end * wf.samplesPerBlock)) / samplesPerRow) + 1);
+    for (int r = first_row; r <= last_row; ++r) {
+        float s = r * samplesPerRow;
+        float y = origin.y + (s / wf.samplesPerBlock) * blockH - scrollY;
+        dl->AddLine(ImVec2(origin.x, y), ImVec2(origin.x + laneWidth, y), IM_COL32(80,80,80,120), 1.0f);
+    }
+
     // Onset lines (horizontal across lane)
-    for (auto &m : markers) {
+    std::vector<SliceMarker> local;
+    { std::lock_guard<std::mutex> lg(markers_mtx); local = markers; }
+    for (auto &m : local) {
         int bi = (int)std::floor((m.time * samplerate) / (float)wf.samplesPerBlock);
         float y = origin.y + bi * blockH - scrollY + blockH * 0.5f;
         ImU32 col = m.selected ? IM_COL32(255,100,100,255) : IM_COL32(255,255,0,220);
