@@ -10,13 +10,55 @@
 #include <algorithm>
 #include <aubio/aubio.h>
 
-// ---- REGION, MARKER, AND WAVEFORM STRUCTS (SAMPLE-BASED!) ----
-struct SliceMarker { float time; }; // time in seconds
+// ===============================================
+// DATA STRUCTURES
+// ===============================================
+struct SliceMarker {
+    float time; // time in seconds
+};
 
 struct SampleRegion {
     int start_sample, end_sample, midi_key;
 };
-// Compute sample-accurate regions
+
+// ===============================================
+// MIDI NOTE HELPERS
+// ===============================================
+const char* get_note_name(int midi_key, char* buf, size_t bufsize) {
+    static const char* kNoteNames[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+    int pc = (midi_key % 12 + 12) % 12;
+    int oct = midi_key / 12 - 1;
+    snprintf(buf, bufsize, "%s%d", kNoteNames[pc], oct);
+    return buf;
+}
+
+// ===============================================
+// ROW CALCULATION HELPERS
+// ===============================================
+struct RowCalculator {
+    int samples_per_row;
+    float seconds_per_row;
+    int total_rows;
+
+    RowCalculator(float bpm, int rows_per_bar, int samplerate, int total_samples) {
+        float seconds_per_bar = (60.f / bpm) * 4.0f;
+        seconds_per_row = seconds_per_bar / rows_per_bar;
+        samples_per_row = int(seconds_per_row * samplerate + 0.5f);
+        total_rows = int((total_samples + samples_per_row - 1) / samples_per_row);
+    }
+
+    int sample_to_row(int sample) const {
+        return sample / samples_per_row;
+    }
+
+    float row_to_seconds(int row) const {
+        return row * seconds_per_row;
+    }
+};
+
+// ===============================================
+// REGION COMPUTATION
+// ===============================================
 std::vector<SampleRegion> compute_sample_regions(
     const std::vector<SliceMarker>& markers, int samplerate, int total_samples, int base_note = 36)
 {
@@ -32,20 +74,40 @@ std::vector<SampleRegion> compute_sample_regions(
     }
     return regions;
 }
-void print_regions_debug(const std::string& sample_name, const std::vector<SampleRegion>& regions) {
-    for (const auto& reg : regions)
-        printf("<region> sample=%s key=%d offset=%d end=%d\n",
+
+void print_regions_debug(const std::string& sample_name, const std::vector<SampleRegion>& regions,
+                         const RowCalculator* rowCalc = nullptr) {
+    for (const auto& reg : regions) {
+        printf("<region> sample=%s key=%d offset=%d end=%d",
                sample_name.c_str(), reg.midi_key, reg.start_sample, reg.end_sample);
+        if (rowCalc) {
+            int start_row = rowCalc->sample_to_row(reg.start_sample);
+            int end_row = rowCalc->sample_to_row(reg.end_sample - 1);
+            char nbuf[16];
+            get_note_name(reg.midi_key, nbuf, sizeof(nbuf));
+            printf(" [%s: row %d-%d]", nbuf, start_row, end_row);
+        }
+        printf("\n");
+    }
     fflush(stdout);
 }
 
-// ---- WAVEFORM STRUCT ----
+// ===============================================
+// WAVEFORM AND AUDIO STATE
+// ===============================================
 struct Waveform {
     std::vector<float> envelope;
     int samplesPerBlock = 128;
 };
 
-// ---- GLOBALS ----
+struct Playback {
+    bool playing = false;
+    size_t start = 0, end = 0, cursor = 0;
+    float volume = 0.8f;
+    SDL_AudioDeviceID dev = 0;
+    SDL_AudioSpec spec{};
+};
+
 static int samplerate = 44100;
 static std::vector<float> waveform;
 static Waveform g_wf;
@@ -54,16 +116,11 @@ static float detected_bpm = 140.f;
 static int base_note = 36;
 static std::string loaded_filename;
 static std::mutex markers_mtx;
+static Playback g_play;
 
-struct Playback {
-    bool playing = false;
-    size_t start = 0, end = 0, cursor = 0;
-    float volume = 0.8f;
-    SDL_AudioDeviceID dev = 0;
-    SDL_AudioSpec spec{};
-} g_play;
-
-// ---- AUDIO ----
+// ===============================================
+// AUDIO PLAYBACK
+// ===============================================
 static void sdl_audio_cb(void* userdata, Uint8* stream, int len) {
     Playback* p = (Playback*)userdata;
     float* out = (float*)stream;
@@ -77,71 +134,131 @@ static void sdl_audio_cb(void* userdata, Uint8* stream, int len) {
         out[i] = sample;
     }
 }
+
 static void audio_reopen_for_current() {
-    if (g_play.dev) { SDL_CloseAudioDevice(g_play.dev); g_play.dev = 0; }
-    SDL_AudioSpec want{}; want.freq = samplerate; want.format = AUDIO_F32; want.channels = 1; want.samples = 1024; want.callback = sdl_audio_cb; want.userdata = &g_play;
+    if (g_play.dev) {
+        SDL_CloseAudioDevice(g_play.dev);
+        g_play.dev = 0;
+    }
+    SDL_AudioSpec want{};
+    want.freq = samplerate;
+    want.format = AUDIO_F32;
+    want.channels = 1;
+    want.samples = 1024;
+    want.callback = sdl_audio_cb;
+    want.userdata = &g_play;
     g_play.dev = SDL_OpenAudioDevice(NULL, 0, &want, &g_play.spec, 0);
     if (g_play.dev) SDL_PauseAudioDevice(g_play.dev, 0);
 }
+
 static void play_region(const SampleRegion& reg) {
     printf("[PLAY] region sample=%s key=%d offset=%d end=%d (length=%d)\n",
-        loaded_filename.c_str(), reg.midi_key, reg.start_sample, reg.end_sample, reg.end_sample-reg.start_sample);
+        loaded_filename.c_str(), reg.midi_key, reg.start_sample, reg.end_sample,
+        reg.end_sample - reg.start_sample);
     fflush(stdout);
     g_play.start = reg.start_sample;
     g_play.cursor = reg.start_sample;
-    g_play.end   = reg.end_sample;
+    g_play.end = reg.end_sample;
     g_play.playing = true;
 }
-static void stop_playback() { g_play.playing = false; }
 
-// ---- LOAD WAV ----
+static void stop_playback() {
+    g_play.playing = false;
+}
+
+// ===============================================
+// WAV FILE LOADING
+// ===============================================
 bool load_wav_mono(const char *path) {
-    SDL_AudioSpec spec; Uint8 *buf; Uint32 len;
+    SDL_AudioSpec spec;
+    Uint8 *buf;
+    Uint32 len;
     if (!SDL_LoadWAV(path, &spec, &buf, &len)) return false;
+
     samplerate = spec.freq;
     SDL_AudioCVT cvt;
-    if (SDL_BuildAudioCVT(&cvt, spec.format, spec.channels, spec.freq, AUDIO_F32, spec.channels, spec.freq) < 0) { SDL_FreeWAV(buf); return false; }
-    cvt.len = len; cvt.buf = (Uint8*)SDL_malloc(cvt.len * cvt.len_mult); if (!cvt.buf) { SDL_FreeWAV(buf); return false; }
+    if (SDL_BuildAudioCVT(&cvt, spec.format, spec.channels, spec.freq,
+                          AUDIO_F32, spec.channels, spec.freq) < 0) {
+        SDL_FreeWAV(buf);
+        return false;
+    }
+
+    cvt.len = len;
+    cvt.buf = (Uint8*)SDL_malloc(cvt.len * cvt.len_mult);
+    if (!cvt.buf) {
+        SDL_FreeWAV(buf);
+        return false;
+    }
+
     SDL_memcpy(cvt.buf, buf, len);
-    if (SDL_ConvertAudio(&cvt) < 0) { SDL_free(cvt.buf); SDL_FreeWAV(buf); return false; }
+    if (SDL_ConvertAudio(&cvt) < 0) {
+        SDL_free(cvt.buf);
+        SDL_FreeWAV(buf);
+        return false;
+    }
+
     int channels = spec.channels;
     int frames = (cvt.len_cvt / (sizeof(float) * channels));
     waveform.resize(frames);
     float *fdata = (float*)cvt.buf;
+
+    // Convert to mono
     for (int i = 0; i < frames; ++i) {
-        float accum = 0.f; for (int c = 0; c < channels; ++c) accum += fdata[i * channels + c];
+        float accum = 0.f;
+        for (int c = 0; c < channels; ++c) {
+            accum += fdata[i * channels + c];
+        }
         waveform[i] = accum / channels;
     }
-    SDL_free(cvt.buf); SDL_FreeWAV(buf);
+
+    SDL_free(cvt.buf);
+    SDL_FreeWAV(buf);
     loaded_filename = std::string(path);
+
+    // Build waveform envelope for visualization
     g_wf.samplesPerBlock = 128;
     g_wf.envelope.clear();
     for (size_t pos = 0; pos < waveform.size(); pos += g_wf.samplesPerBlock) {
         float peak = 0.f;
         size_t end = std::min(pos + (size_t)g_wf.samplesPerBlock, waveform.size());
-        for (size_t i = pos; i < end; ++i) { float a = std::fabs(waveform[i]); if (a > peak) peak = a; }
+        for (size_t i = pos; i < end; ++i) {
+            float a = std::fabs(waveform[i]);
+            if (a > peak) peak = a;
+        }
         g_wf.envelope.push_back(peak);
     }
     return true;
 }
 
+// ===============================================
+// ONSET DETECTION
+// ===============================================
 void detect_onsets_aubio(float bpm, int ppqn) {
     std::vector<SliceMarker> out;
-    uint_t hop_size = 512; uint_t win_size = 1024;
+    uint_t hop_size = 512;
+    uint_t win_size = 1024;
+
     aubio_onset_t *onset = new_aubio_onset("default", win_size, hop_size, samplerate);
     aubio_tempo_t *tempo = new_aubio_tempo("default", win_size, hop_size, samplerate);
     fvec_t *buf = new_fvec(hop_size);
     fvec_t *o_out = new_fvec(1);
     fvec_t *t_out = new_fvec(1);
+
     int total_frames = (int)waveform.size();
     for (int pos = 0; pos < total_frames; pos += (int)hop_size) {
         int remain = std::min<int>(hop_size, total_frames - pos);
-        for (int i = 0; i < (int)hop_size; ++i) buf->data[i] = (i < remain) ? waveform[pos + i] : 0.f;
+        for (int i = 0; i < (int)hop_size; ++i) {
+            buf->data[i] = (i < remain) ? waveform[pos + i] : 0.f;
+        }
+
+        // Detect tempo
         aubio_tempo_do(tempo, buf, t_out);
         if (t_out->data[0] > 0) {
             float _bpm = aubio_tempo_get_bpm(tempo);
             if (_bpm > 0) detected_bpm = _bpm;
         }
+
+        // Detect onsets
         aubio_onset_do(onset, buf, o_out);
         if (o_out->data[0] > 0) {
             float t_frames = aubio_onset_get_last(onset);
@@ -149,12 +266,120 @@ void detect_onsets_aubio(float bpm, int ppqn) {
             out.push_back({t});
         }
     }
-    del_fvec(o_out); del_fvec(t_out); del_fvec(buf); del_aubio_onset(onset); del_aubio_tempo(tempo);
-    std::sort(out.begin(), out.end(), [](auto&a,auto&b){return a.time < b.time;});
+
+    del_fvec(o_out);
+    del_fvec(t_out);
+    del_fvec(buf);
+    del_aubio_onset(onset);
+    del_aubio_tempo(tempo);
+
+    std::sort(out.begin(), out.end(), [](auto& a, auto& b) { return a.time < b.time; });
     markers = std::move(out);
 }
 
-// ---- ROW/REGION TRACKER WAVEFORM/GUI DRAW ----
+// ===============================================
+// RENDERING HELPERS
+// ===============================================
+struct RenderContext {
+    ImDrawList* dl;
+    ImVec2 origin;
+    float scrollY;
+    float rowNumWidth;
+    float laneWidth;
+    float markerWidth;
+    const RowCalculator& rowCalc;
+    float audio_length;
+};
+
+void draw_playback_indicator(const RenderContext& ctx, const std::vector<SampleRegion>& regions) {
+    if (!g_play.playing || regions.empty()) return;
+
+    // Find which region is currently playing
+    for (const SampleRegion& reg : regions) {
+        if ((int)g_play.cursor >= reg.start_sample && (int)g_play.cursor < reg.end_sample) {
+            int row0 = ctx.rowCalc.sample_to_row(reg.start_sample);
+            int row1 = ctx.rowCalc.sample_to_row(reg.end_sample - 1);
+            int nrows = row1 - row0 + 1;
+
+            // Highlight all rows in this region
+            for (int row = row0; row <= row1; ++row) {
+                float y1 = ctx.origin.y + row * 36.f - ctx.scrollY;
+                float y2 = y1 + 36.f;
+                ctx.dl->AddRectFilled(
+                    ImVec2(ctx.origin.x + ctx.rowNumWidth, y1),
+                    ImVec2(ctx.origin.x + ctx.rowNumWidth + ctx.laneWidth, y2),
+                    IM_COL32(60, 255, 80, 60));
+            }
+
+            // Draw playhead position within the region
+            float frac = float(g_play.cursor - reg.start_sample) /
+                         float(std::max(1, reg.end_sample - reg.start_sample));
+            float ph_y = ctx.origin.y + row0 * 36.f + frac * (nrows * 36.f) - ctx.scrollY;
+            ctx.dl->AddLine(
+                ImVec2(ctx.origin.x + ctx.rowNumWidth, ph_y),
+                ImVec2(ctx.origin.x + ctx.rowNumWidth + ctx.laneWidth, ph_y),
+                IM_COL32(60, 255, 60, 255), 3.2f);
+            break;
+        }
+    }
+}
+
+void draw_waveform_for_row(const RenderContext& ctx, int row, int rows_per_bar) {
+    float row_start_sec = ctx.rowCalc.row_to_seconds(row);
+    float row_end_sec = ctx.rowCalc.row_to_seconds(row + 1);
+    float env_start_frac = row_start_sec / ctx.audio_length;
+    float env_end_frac = row_end_sec / ctx.audio_length;
+    int env_start_idx = int(env_start_frac * g_wf.envelope.size());
+    int env_end_idx = std::min(int(env_end_frac * g_wf.envelope.size()), int(g_wf.envelope.size()));
+
+    float y = ctx.origin.y + row * 36.f - ctx.scrollY;
+    float lane_center = ctx.origin.x + ctx.rowNumWidth + ctx.laneWidth / 2.f;
+    float wf_y1 = y + 3;
+    float wf_y2 = y + 36.f - 4;
+    int bars = env_end_idx - env_start_idx;
+
+    for (int e = 0; e < bars; ++e) {
+        float amp = g_wf.envelope[env_start_idx + e];
+        float half = amp * (ctx.laneWidth / 2.f);
+        float frac = bars > 1 ? e / float(bars - 1) : 0.5f;
+        float cy = wf_y1 + frac * (wf_y2 - wf_y1);
+        ctx.dl->AddLine(
+            ImVec2(lane_center - half, cy),
+            ImVec2(lane_center + half, cy),
+            IM_COL32(70, 220, 255, 205), 1.6f);
+    }
+}
+
+void draw_region_marker(const RenderContext& ctx, int row, const SampleRegion& r, int region_index) {
+    float y = ctx.origin.y + row * 36.f - ctx.scrollY;
+    float labelx = ctx.origin.x + ctx.rowNumWidth + ctx.laneWidth + 24.f;
+
+    // Offset label vertically based on how many regions start on this row
+    float labely = y + 5.f + (region_index * 18.f);
+
+    // Draw slice marker line
+    ctx.dl->AddLine(
+        ImVec2(ctx.origin.x + ctx.rowNumWidth, y),
+        ImVec2(ctx.origin.x + ctx.rowNumWidth + ctx.laneWidth, y),
+        IM_COL32(255, 70, 40, 255), 3.5f);
+
+    // Draw note label
+    char nbuf[16];
+    get_note_name(r.midi_key, nbuf, sizeof(nbuf));
+    ctx.dl->AddText(ImVec2(labelx, labely), IM_COL32(230, 230, 230, 255), nbuf);
+
+    // Draw PLAY button
+    ImGui::SetCursorScreenPos(ImVec2(labelx + 60.f, labely - 3));
+    ImGui::PushID(r.midi_key * 1000 + region_index);
+    if (ImGui::SmallButton("PLAY")) {
+        play_region(r);
+    }
+    ImGui::PopID();
+}
+
+// ===============================================
+// MAIN TRACKER DRAWING FUNCTION
+// ===============================================
 void draw_tracker_and_wave(
     float rowNumWidth, float laneWidth, float markerWidth, float panel_height,
     int rows_per_bar, float bpm)
@@ -163,19 +388,18 @@ void draw_tracker_and_wave(
         ImGui::TextUnformatted("No waveform loaded");
         return;
     }
-    float seconds_per_bar = (60.f / bpm) * 4.0f;
-    float audio_length = waveform.size() / float(samplerate);
-    float seconds_per_row = seconds_per_bar / rows_per_bar;
-    int samples_per_row_i = int(seconds_per_row * samplerate + 0.5f); // integer samples per row for consistent mapping
-    int total_rows = int((waveform.size() + samples_per_row_i - 1) / samples_per_row_i);
 
-    // Compute regions in samples
-    std::vector<SampleRegion> regions = compute_sample_regions(markers, samplerate, waveform.size(), base_note);
+    // Calculate row metrics
+    RowCalculator rowCalc(bpm, rows_per_bar, samplerate, waveform.size());
+    float audio_length = waveform.size() / float(samplerate);
+
+    // Compute regions and print debug info
+    std::vector<SampleRegion> regions = compute_sample_regions(
+        markers, samplerate, waveform.size(), base_note);
     static std::string last_region_filename;
     static size_t last_region_count = 0;
-    // If file or region count changes, print regions debug to stdout
     if (loaded_filename != last_region_filename || regions.size() != last_region_count) {
-        print_regions_debug(loaded_filename, regions);
+        print_regions_debug(loaded_filename, regions, &rowCalc);
         last_region_filename = loaded_filename;
         last_region_count = regions.size();
     }
@@ -186,106 +410,90 @@ void draw_tracker_and_wave(
     ImVec2 origin = ImGui::GetCursorScreenPos();
     float scrollY = ImGui::GetScrollY();
 
-    // ---- PLAY ANIMATION ----
-    if (g_play.playing && !regions.empty()) {
-        for (const SampleRegion& reg : regions) {
-            if ((int)g_play.cursor >= reg.start_sample && (int)g_play.cursor < reg.end_sample) {
-                int row0 = reg.start_sample / samples_per_row_i;
-                int row1 = (reg.end_sample - 1) / samples_per_row_i;
-                int nrows = row1 - row0 + 1;
-                for (int row = row0; row <= row1; ++row) {
-                    float y1 = origin.y + row * 36.f - scrollY;
-                    float y2 = y1 + 36.f;
-                    dl->AddRectFilled(ImVec2(origin.x + rowNumWidth, y1),
-                                      ImVec2(origin.x + rowNumWidth + laneWidth, y2),
-                                      IM_COL32(60,255,80,60));
-                }
-                float frac = float(g_play.cursor - reg.start_sample) / float(std::max(1,reg.end_sample - reg.start_sample));
-                float ph_y = origin.y + row0 * 36.f + frac * (nrows * 36.f) - scrollY;
-                dl->AddLine(ImVec2(origin.x + rowNumWidth, ph_y), ImVec2(origin.x + rowNumWidth + laneWidth, ph_y), IM_COL32(60,255,60,255), 3.2f);
+    RenderContext ctx{dl, origin, scrollY, rowNumWidth, laneWidth, markerWidth, rowCalc, audio_length};
+
+    // Draw playback indicator (if playing)
+    draw_playback_indicator(ctx, regions);
+
+    // MAIN ROW LOOP
+    for (int row = 0; row < rowCalc.total_rows; ++row) {
+        float y = origin.y + row * 36.f - scrollY;
+        if (y + 36.f < origin.y) continue;
+
+        // Draw row background
+        ImU32 rowbg = row % 2 ? IM_COL32(38, 38, 46, 220) : IM_COL32(32, 32, 38, 240);
+        dl->AddRectFilled(
+            ImVec2(origin.x, y),
+            ImVec2(origin.x + rowNumWidth + laneWidth + markerWidth, y + 36.f),
+            rowbg, 0.0f);
+
+        // Draw row number
+        char numb[12];
+        snprintf(numb, sizeof(numb), "%02d", row + 1);
+        dl->AddText(ImVec2(origin.x + 10, y + 10), IM_COL32(200, 220, 255, 255), numb);
+
+        // Draw grid line
+        float grid_thick = (row % rows_per_bar == 0) ? 2.5f : 1.2f;
+        ImU32 grid_col = (row % rows_per_bar == 0) ?
+            IM_COL32(240, 180, 40, 220) : IM_COL32(120, 120, 120, 90);
+        dl->AddLine(
+            ImVec2(origin.x, y),
+            ImVec2(origin.x + rowNumWidth + laneWidth + markerWidth, y),
+            grid_col, grid_thick);
+
+        // Draw waveform for this row
+        draw_waveform_for_row(ctx, row, rows_per_bar);
+
+        // Draw region markers (only on the start row of each region)
+        // Count how many regions start on this row for vertical offset
+        int region_idx_on_row = 0;
+        for (size_t m = 0; m < regions.size(); ++m) {
+            int region_row = rowCalc.sample_to_row(regions[m].start_sample);
+            if (row == region_row) {
+                draw_region_marker(ctx, row, regions[m], region_idx_on_row);
+                region_idx_on_row++;
+            }
+        }
+
+        // Handle marker add/remove with mouse clicks
+        float gridbtn_height = 12.0f;
+        ImGui::SetCursorScreenPos(ImVec2(origin.x, y));
+        ImGui::InvisibleButton(
+            ("gridbtn_" + std::to_string(row)).c_str(),
+            ImVec2(rowNumWidth + laneWidth + markerWidth, gridbtn_height));
+
+        // Check if there's already a marker on this row
+        bool marker_drawn = false;
+        for (size_t m = 0; m < regions.size(); ++m) {
+            int region_row = rowCalc.sample_to_row(regions[m].start_sample);
+            if (row == region_row) {
+                marker_drawn = true;
                 break;
             }
         }
-    }
 
-    // --------- MAIN ROWS: MARKERS, WAVEFORM, [PLAY] BUTTONS ----------
-    for (int row = 0; row < total_rows; ++row) {
-        float y = origin.y + row * 36.f - scrollY;
-        if (y + 36.f < origin.y) continue;
-        float row_start_sec = row * seconds_per_row;
-        float row_end_sec = (row+1) * seconds_per_row;
-        int row_start_sample = row * samples_per_row_i;
-        int row_end_sample = (row + 1) * samples_per_row_i;
-
-        ImU32 rowbg = row % 2 ? IM_COL32(38,38,46,220) : IM_COL32(32,32,38,240);
-        dl->AddRectFilled(ImVec2(origin.x, y), ImVec2(origin.x+rowNumWidth+laneWidth+markerWidth, y+36.f), rowbg, 0.0f);
-        char numb[12]; snprintf(numb, sizeof(numb), "%02d", row+1);
-        dl->AddText(ImVec2(origin.x+10, y+10), IM_COL32(200,220,255,255), numb);
-        float grid_thick = (row % rows_per_bar == 0) ? 2.5f : 1.2f;
-        ImU32 grid_col = (row % rows_per_bar == 0) ? IM_COL32(240,180,40,220) : IM_COL32(120,120,120,90);
-        dl->AddLine(ImVec2(origin.x, y), ImVec2(origin.x+rowNumWidth+laneWidth+markerWidth, y), grid_col, grid_thick);
-
-        // --- waveform for row ---
-        float env_start_frac = row_start_sec / audio_length;
-        float env_end_frac = row_end_sec / audio_length;
-        int env_start_idx = int(env_start_frac * g_wf.envelope.size());
-        int env_end_idx = std::min(int(env_end_frac * g_wf.envelope.size()), int(g_wf.envelope.size()));
-        float lane_center = origin.x + rowNumWidth + laneWidth / 2.f;
-        float wf_y1 = y + 3, wf_y2 = y + 36.f - 4;
-        int bars = env_end_idx - env_start_idx;
-        for (int e = 0; e < bars; ++e) {
-            float amp = g_wf.envelope[env_start_idx + e];
-            float half = amp * (laneWidth / 2.f);
-            float frac = bars > 1 ? e / float(bars - 1) : 0.5f;
-            float cy = wf_y1 + frac * (wf_y2 - wf_y1);
-            dl->AddLine(ImVec2(lane_center - half, cy), ImVec2(lane_center + half, cy), IM_COL32(70,220,255,205), 1.6f);
-        }
-
-        // --- region marker/label/PLAY: only in row that contains the region's start_sample ---
-        for (size_t m = 0; m < regions.size(); ++m) {
-            int marker_row = regions[m].start_sample / samples_per_row_i;
-            if (row == marker_row) {
-                const SampleRegion& r = regions[m];
-                float labelx = origin.x + rowNumWidth + laneWidth + 24.f;
-                float labely = y + 5.f;
-                dl->AddLine(ImVec2(origin.x + rowNumWidth, y), ImVec2(origin.x + rowNumWidth + laneWidth, y), IM_COL32(255,70,40,255), 3.5f);
-                int note = r.midi_key;
-                static const char* kNoteNames[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
-                int pc = (note%12+12)%12, oct = note/12 - 1;
-                char nbuf[16]; snprintf(nbuf, sizeof(nbuf), "%s%d", kNoteNames[pc], oct);
-                dl->AddText(ImVec2(labelx, labely), IM_COL32(230,230,230,255), nbuf);
-                ImGui::SetCursorScreenPos(ImVec2(labelx + 60.f, labely - 3));
-                ImGui::PushID(int(row*5000 + m));
-                if (ImGui::SmallButton("PLAY")) play_region(r);
-                ImGui::PopID();
-            }
-        }
-
-        // --- add/remove marker logic ---
-        float gridbtn_height = 12.0f;
-        ImGui::SetCursorScreenPos(ImVec2(origin.x, y));
-        ImGui::InvisibleButton(("gridbtn_" + std::to_string(row)).c_str(), ImVec2(rowNumWidth + laneWidth + markerWidth, gridbtn_height));
-        bool marker_drawn = false;
-        for (size_t m = 0; m < regions.size(); ++m) {
-            int marker_row = regions[m].start_sample / samples_per_row_i;
-            if (row == marker_row) marker_drawn = true;
-        }
         bool grid_hovered = ImGui::IsItemHovered() && ImGui::IsWindowFocused();
+
+        // Left-click to add marker
         if (grid_hovered && ImGui::IsMouseClicked(0) && !marker_drawn) {
-            markers.push_back({row * seconds_per_row});
-            std::sort(markers.begin(), markers.end(), [](auto&a,auto&b){return a.time < b.time;});
+            markers.push_back({rowCalc.row_to_seconds(row)});
+            std::sort(markers.begin(), markers.end(),
+                [](auto& a, auto& b) { return a.time < b.time; });
         }
+
+        // Right-click to remove marker
         if (grid_hovered && ImGui::IsMouseClicked(1) && marker_drawn) {
-            markers.erase(std::remove_if(markers.begin(), markers.end(), [&](const SliceMarker& m) {
-                int marker_sample = int(m.time * samplerate + 0.5f);
-                int marker_row = marker_sample / samples_per_row_i;
-                return marker_row == row;
-            }), markers.end());
+            markers.erase(std::remove_if(markers.begin(), markers.end(),
+                [&](const SliceMarker& m) {
+                    int marker_row = rowCalc.sample_to_row(
+                        int(m.time * samplerate + 0.5f));
+                    return marker_row == row;
+                }), markers.end());
         }
     }
 
-    ImGui::SetCursorPosY(total_rows * 36.f);
-    ImGui::Dummy(ImVec2(0,0));
+    ImGui::SetCursorPosY(rowCalc.total_rows * 36.f);
+    ImGui::Dummy(ImVec2(0, 0));
     ImGui::EndChild();
 }
 
